@@ -6,8 +6,10 @@
 #include <stdlib.h>
 #include <string.h>
 #include <sys/time.h>
+#include <sys/wait.h>
 #include <time.h>
 #include <unistd.h>
+#include <math.h>
 
 #define BUF_LEN 1024
 
@@ -25,21 +27,34 @@
         goto cexec;                                                            \
     }
 
-void exec_child(char *argcv[]) {
-    execvp(argcv[0], argcv);
+void exec_child(char *argv[]) {
+    execvp(argv[0], argv);
     if(errno != 0)
         perror(strerror(errno));
     exit(1);
 }
 
 static struct option long_options[] = {
-    {"prestop", optional_argument, NULL, 'p'}, {NULL, 0, NULL, 0}};
+    {"hook", optional_argument, NULL, 'h'},
+    {"percent", optional_argument, NULL, 'p'},
+    {NULL, 0, NULL, 0}};
+
+void usage(char *cmd) {
+    fprintf(
+        stderr, "%s [-h <one-line-shell>] [-p <pre-oom percentage>] -- <cmd to run>\n", cmd);
+    fprintf(
+        stderr, "args: -h | --hook:    one-line-shell to be run on pre-oom. optional\n");
+    fprintf(
+        stderr, "      -p | --percent: pre-oom threshold percentage. default: 90%%\n");
+    exit(EXIT_FAILURE);
+}
 
 int main(int argc, char *argv[]) {
     int c, option_index;
-    const char *optstring = "p:";
+    const char *optstring = "h:p:";
     opterr = 0;
-    char *prestop = NULL;
+    char *hook = NULL;
+    double mem_percentage = 90;
 
     while(1) {
         option_index = 0;
@@ -51,12 +66,26 @@ int main(int argc, char *argv[]) {
         switch(c) {
         case 0:
             if(option_index == 0) {
-                prestop = optarg;
+                hook = optarg;
+            }
+            if(option_index == 1) {
+                if(sscanf(optarg, "%lf", &mem_percentage) != 1)
+                    usage(argv[0]);
+                if(mem_percentage >= 100.0 && mem_percentage <= 0.0)
+                    usage(argv[0]);
             }
             break;
-        case 'p':
-            prestop = optarg;
+        case 'h':
+            hook = optarg;
             break;
+        case 'p':
+            if(sscanf(optarg, "%lf", &mem_percentage) != 1)
+                usage(argv[0]);
+            if(mem_percentage >= 100.0 && mem_percentage <= 0.0)
+                usage(argv[0]);
+            break;
+        default:
+            usage(argv[0]);
         }
     }
 
@@ -81,7 +110,7 @@ int main(int argc, char *argv[]) {
         while(fgets(buf, BUF_LEN, fp) != NULL) {
             const char *prefix = "hierarchical_memory_limit";
             if(strncmp(prefix, buf, strlen(prefix)) == 0) {
-                sscanf(buf, "hierarchical_memory_limit %lld", &mem_max);
+                sscanf(buf, "hierarchical_memory_limit %ld", &mem_max);
                 if(mem_max == -1 || mem_max == INT64_MAX) {
                     EXEC_FALLBACK("no max memory limit, just exec...");
                 }
@@ -124,7 +153,7 @@ int main(int argc, char *argv[]) {
     }
 
     // set soft mem limit
-    mem_max = mem_max / 100 * 90;
+    mem_max = (int64_t) round(mem_max / 100.0 * mem_percentage);
 
     // prepare for signal handling (via sigwait)
     sigemptyset(&ss);
@@ -170,16 +199,22 @@ int main(int argc, char *argv[]) {
 
     // signal handling
     int wstatus;
-    int wpid;
-    int child_exited = 0, preoom = 0;
+    int wpid, hpid = -1;
+    int child_exited = 0, preoom = 0, hook_exited = 0;
 
     while(!child_exited) {
         if(sigwait(&ss, &signo) == 0) {
             switch(signo) {
             case SIGCHLD:
                 // child process status changed, check if exited
-                wpid = waitpid(cpid, &wstatus, NULL);
-                child_exited = 1;
+                // (ignore possible pre-oom hook)
+                wpid = waitpid(-1, &wstatus, WNOHANG);
+                if(wpid == cpid) {
+                    child_exited = 1;
+                }
+                if(hpid > 0 && hpid == wpid) {
+                    hook_exited = 1;
+                }
                 break;
             case SIGINT:
             case SIGQUIT:
@@ -194,7 +229,7 @@ int main(int argc, char *argv[]) {
                 break;
             case SIGALRM:
                 if(preoom) {
-                    // already preoom
+                    // preoom already handled
                     break;
                 }
                 // check memory usage periodically
@@ -208,8 +243,35 @@ int main(int argc, char *argv[]) {
                     }
                     fprintf(stderr, "cur/max %ld/%ld\n", mem_cur, mem_max);
                     if(mem_cur > mem_max) {
+                        // pre oom
                         preoom = 1;
-                        kill(cpid, SIGTERM);
+                        ret = kill(cpid, SIGTERM);
+                        if(ret == -1) {
+                            perror("kill (pre-oom)");
+                            child_exited = 1; // force quit
+                        }
+
+                        // pre oom hook if set
+                        if(hook != NULL) {
+                            // fork
+                            hpid = fork();
+                            if(hpid == -1) {
+                                perror("fork");
+                                exit(EXIT_FAILURE);
+                            }
+
+                            // exec (child)
+                            if(hpid == 0) {
+                                char *hook_cmd[] = {"/bin/sh", "-c", hook,
+                                                    NULL};
+                                ret = sigprocmask(SIG_SETMASK, &oldss, NULL);
+                                if(ret != 0) {
+                                    perror("sigprocmask(restore)");
+                                    exit(EXIT_FAILURE);
+                                }
+                                exec_child(hook_cmd);
+                            }
+                        }
                     }
                 }
                 break;
@@ -217,28 +279,9 @@ int main(int argc, char *argv[]) {
         }
     }
 
-    // post processing if set
-    if(prestop != NULL && preoom) {
-        // fork
-        pid_t cpid = fork();
-        if(cpid == -1) {
-            perror("fork");
-            exit(EXIT_FAILURE);
-        }
-
-        // exec (child)
-        if(cpid == 0) {
-            char *prestop_cmd[] = {"/bin/sh", "-c", prestop, NULL};
-            ret = sigprocmask(SIG_SETMASK, &oldss, NULL);
-            if(ret != 0) {
-                perror("sigprocmask(restore)");
-                exit(EXIT_FAILURE);
-            }
-            exec_child(prestop_cmd);
-        }
-
+    if(hook != NULL && !hook_exited) {
         // parent
-        wpid = waitpid(cpid, &wstatus, 0);
+        wpid = waitpid(hpid, NULL, 0);
     }
     return wstatus;
 }
