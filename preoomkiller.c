@@ -241,7 +241,7 @@ int main(int argc, char *argv[]) {
                         perror("failed on reading current memory usage. exit.");
                         exit(EXIT_FAILURE);
                     }
-                    fprintf(stderr, "cur/max %ld/%ld\n", mem_cur, mem_max);
+                    //fprintf(stderr, "cur/max %ld/%ld\n", mem_cur, mem_max);
                     if(mem_cur > mem_max) {
                         // pre oom
                         preoom = 1;
