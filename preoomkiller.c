@@ -1,5 +1,6 @@
 #include <errno.h>
 #include <getopt.h>
+#include <math.h>
 #include <signal.h>
 #include <stdint.h>
 #include <stdio.h>
@@ -9,7 +10,6 @@
 #include <sys/wait.h>
 #include <time.h>
 #include <unistd.h>
-#include <math.h>
 
 #define BUF_LEN 1024
 
@@ -27,6 +27,10 @@
         goto cexec;                                                            \
     }
 
+char buf[BUF_LEN];
+int64_t mem_max = -1;
+sigset_t oldss;
+
 void exec_child(char *argv[]) {
     execvp(argv[0], argv);
     if(errno != 0)
@@ -41,12 +45,63 @@ static struct option long_options[] = {
 
 void usage(char *cmd) {
     fprintf(
-        stderr, "%s [-h <one-line-shell>] [-p <pre-oom percentage>] -- <cmd to run>\n", cmd);
+        stderr,
+        "%s [-h <one-line-shell>] [-p <pre-oom percentage>] -- <cmd to run>\n",
+        cmd);
+    fprintf(stderr, "args: -h | --hook:    one-line-shell to be run on "
+                    "pre-oom. optional\n");
     fprintf(
-        stderr, "args: -h | --hook:    one-line-shell to be run on pre-oom. optional\n");
-    fprintf(
-        stderr, "      -p | --percent: pre-oom threshold percentage. default: 90%%\n");
+        stderr,
+        "      -p | --percent: pre-oom threshold percentage. default: 90%%\n");
     exit(EXIT_FAILURE);
+}
+
+int preoom(FILE *fp, int cpid, char *hook, int *hpid) {
+    // check memory usage periodically
+    int mem_cur, ret;
+    int preoom = 0;
+    rewind(fp);
+    if(fgets(buf, BUF_LEN, fp) != NULL) {
+        errno = 0;
+        mem_cur = strtoll(buf, NULL, 10);
+        if(errno != 0) {
+            perror("failed on reading current memory usage. exit.");
+            exit(EXIT_FAILURE);
+        }
+        // fprintf(stderr, "cur/max %ld/%ld\n", mem_cur, mem_max);
+        if(mem_cur > mem_max) {
+            // pre oom
+            preoom = 1;
+
+            // pre oom hook if set
+            if(hook != NULL) {
+                // fork
+                *hpid = fork();
+                if(*hpid == -1) {
+                    perror("fork");
+                    exit(EXIT_FAILURE);
+                }
+
+                // exec (child)
+                if(*hpid == 0) {
+                    char *hook_cmd[] = {"/bin/sh", "-c", hook, NULL};
+                    ret = sigprocmask(SIG_SETMASK, &oldss, NULL);
+                    if(ret != 0) {
+                        perror("sigprocmask(restore)");
+                        exit(EXIT_FAILURE);
+                    }
+                    exec_child(hook_cmd);
+                }
+            }
+
+            ret = kill(cpid, SIGTERM);
+            if(ret == -1) {
+                perror("kill (pre-oom)");
+                exit(EXIT_FAILURE); // force quit
+            }
+        }
+    }
+    return preoom;
 }
 
 int main(int argc, char *argv[]) {
@@ -89,11 +144,11 @@ int main(int argc, char *argv[]) {
         }
     }
 
-    sigset_t ss, oldss;
-    int ret, signo;
-    int64_t mem_max = -1, mem_cur;
+    if(argc == optind) {
+        usage(argv[0]);
+    }
+
     FILE *fp;
-    char buf[BUF_LEN];
 
     // check cgroup existance & version
     if(access("/sys/fs/cgroup", F_OK) != 0) {
@@ -103,7 +158,7 @@ int main(int argc, char *argv[]) {
     if(access("/sys/fs/cgroup/memory", X_OK) == 0) {
         // cgroup v1
         // read max memory
-        fp = fopen("/sys/fs/cgroup/memory/memory.stat", "r");
+        fp = fopen("/sys/fs/cgroup/memory/memory.stat", "re");
         if(fp == NULL) {
             EXEC_FALLBACK("failed on read memory.stat, just exec...");
         }
@@ -116,7 +171,7 @@ int main(int argc, char *argv[]) {
                 }
                 fclose(fp);
                 // open current memory usage file
-                fp = fopen("/sys/fs/cgroup/memory/memory.usage_in_bytes", "r");
+                fp = fopen("/sys/fs/cgroup/memory/memory.usage_in_bytes", "re");
                 if(fp == NULL) {
                     EXEC_FALLBACK(
                         "failed on read memory.usage_in_bytes, just exec...");
@@ -130,7 +185,7 @@ int main(int argc, char *argv[]) {
     } else if(access("/sys/fs/cgroup/memory.max", F_OK) == 0) {
         // cgroup v2
         // read max memory
-        fp = fopen("/sys/fs/cgroup/memory.max", "r");
+        fp = fopen("/sys/fs/cgroup/memory.max", "re");
         if(fp == NULL) {
             EXEC_FALLBACK("failed on read memory.max, just exec...");
         }
@@ -143,7 +198,7 @@ int main(int argc, char *argv[]) {
             if(errno != 0) {
                 EXEC_FALLBACK("failed on reading memory limit, just exec...");
             }
-            fp = fopen("/sys/fs/cgroup/memory.current", "r");
+            fp = fopen("/sys/fs/cgroup/memory.current", "re");
             if(fp == NULL) {
                 EXEC_FALLBACK("failed on read memory.current, just exec...");
             }
@@ -153,9 +208,12 @@ int main(int argc, char *argv[]) {
     }
 
     // set soft mem limit
-    mem_max = (int64_t) round(mem_max / 100.0 * mem_percentage);
+    mem_max = (int64_t)round(mem_max / 100.0 * mem_percentage);
 
     // prepare for signal handling (via sigwait)
+    sigset_t ss;
+    int ret;
+
     sigemptyset(&ss);
     SIGADDSET(ss, SIGHUP);
     SIGADDSET(ss, SIGINT);
@@ -163,6 +221,7 @@ int main(int argc, char *argv[]) {
     SIGADDSET(ss, SIGTERM);
     SIGADDSET(ss, SIGALRM);
     SIGADDSET(ss, SIGCHLD);
+    SIGADDSET(ss, SIGBUS);
     ret = sigprocmask(SIG_BLOCK, &ss, &oldss);
     if(ret != 0)
         exit(EXIT_FAILURE);
@@ -186,102 +245,69 @@ int main(int argc, char *argv[]) {
     }
 
     // parent handling starts here
-    // set timer
-    struct itimerval timer;
-    timer.it_value.tv_sec = 1;
-    timer.it_value.tv_usec = 0;
-    timer.it_interval.tv_sec = 1;
-    timer.it_interval.tv_usec = 0;
-    if(setitimer(ITIMER_REAL, &timer, NULL) < 0) {
-        perror("setitimer error");
-        exit(EXIT_FAILURE);
-    }
-
     // signal handling
-    int wstatus;
+    int wstatus, cstatus;
     int wpid, hpid = -1;
-    int child_exited = 0, preoom = 0, hook_exited = 0;
+    int child_all_exited = 0, preoomed = 0, hook_exited = 0;
+    struct timespec ts = {.tv_sec = 1, .tv_nsec = 0};
+    siginfo_t sig;
 
-    while(!child_exited) {
-        if(sigwait(&ss, &signo) == 0) {
-            switch(signo) {
-            case SIGCHLD:
-                // child process status changed, check if exited
-                // (ignore possible pre-oom hook)
-                wpid = waitpid(-1, &wstatus, WNOHANG);
-                if(wpid == cpid) {
-                    child_exited = 1;
-                }
-                if(hpid > 0 && hpid == wpid) {
-                    hook_exited = 1;
-                }
+    while(!child_all_exited) {
+        if(sigtimedwait(&ss, &sig, &ts) == -1) {
+            switch(errno) {
+            case EAGAIN:
                 break;
-            case SIGINT:
-            case SIGQUIT:
-            case SIGTERM:
-            case SIGHUP:
+            case EINTR:
+                break;
+            default:
+                perror("sigtimedwait:");
+                exit(EXIT_FAILURE);
+            }
+        } else {
+            switch(sig.si_signo) {
+            case SIGCHLD:
+                // handled below, just ignore
+                break;
+            default:
                 // forward signals to child
-                fprintf(stderr, "forward kill %d %d\n", cpid, signo);
-                ret = kill(cpid, signo);
+                fprintf(stderr, "forward kill %d %d\n", cpid, sig.si_signo);
+                ret = kill(cpid, sig.si_signo);
                 if(ret == -1) {
                     perror("kill (forward)");
                 }
                 break;
-            case SIGALRM:
-                if(preoom) {
-                    // preoom already handled
-                    break;
-                }
-                // check memory usage periodically
-                rewind(fp);
-                if(fgets(buf, BUF_LEN, fp) != NULL) {
-                    errno = 0;
-                    mem_cur = strtoll(buf, NULL, 10);
-                    if(errno != 0) {
-                        perror("failed on reading current memory usage. exit.");
-                        exit(EXIT_FAILURE);
-                    }
-                    //fprintf(stderr, "cur/max %ld/%ld\n", mem_cur, mem_max);
-                    if(mem_cur > mem_max) {
-                        // pre oom
-                        preoom = 1;
-                        ret = kill(cpid, SIGTERM);
-                        if(ret == -1) {
-                            perror("kill (pre-oom)");
-                            child_exited = 1; // force quit
-                        }
-
-                        // pre oom hook if set
-                        if(hook != NULL) {
-                            // fork
-                            hpid = fork();
-                            if(hpid == -1) {
-                                perror("fork");
-                                exit(EXIT_FAILURE);
-                            }
-
-                            // exec (child)
-                            if(hpid == 0) {
-                                char *hook_cmd[] = {"/bin/sh", "-c", hook,
-                                                    NULL};
-                                ret = sigprocmask(SIG_SETMASK, &oldss, NULL);
-                                if(ret != 0) {
-                                    perror("sigprocmask(restore)");
-                                    exit(EXIT_FAILURE);
-                                }
-                                exec_child(hook_cmd);
-                            }
-                        }
-                    }
-                }
-                break;
             }
         }
+
+        // child process status changed, check if exited
+        // (ignore possible pre-oom hook)
+        while(1) {
+            wpid = waitpid(-1, &wstatus, WNOHANG);
+            if(wpid == -1) {
+                if(errno != ECHILD) {
+                    perror("waitpid");
+                }
+                child_all_exited = 1;
+                break;
+            }
+            if(wpid == 0) {
+                // nothing quited yet
+                break;
+            }
+            if(wpid != hpid) {
+                cstatus = wstatus;
+            }
+        }
+
+        if(!preoomed)
+            preoomed = preoom(fp, cpid, hook, &hpid);
     }
 
-    if(hook != NULL && !hook_exited) {
-        // parent
-        wpid = waitpid(hpid, NULL, 0);
+    // normalize exit code
+    if(WIFEXITED(cstatus)) {
+        cstatus = WEXITSTATUS(cstatus);
+    } else if(WIFSIGNALED(cstatus)) {
+        cstatus = 128 + WTERMSIG(cstatus);
     }
-    return wstatus;
+    return cstatus;
 }
